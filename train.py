@@ -8,7 +8,6 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-import contextlib
 import gc
 import time
 from dataclasses import dataclass, asdict
@@ -63,7 +62,14 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
-def get_compute_dtype(device_type):
+def get_compute_dtype(device_or_type):
+    """Return the preferred reduced-precision dtype for a device type or torch.device.
+
+    Accepts either a string device type such as ``"mps"``/``"cuda"``/``"cpu"``
+    or a ``torch.device`` instance. Returns ``torch.float16`` for MPS devices
+    and ``torch.bfloat16`` for every other device type.
+    """
+    device_type = device_or_type.type if isinstance(device_or_type, torch.device) else device_or_type
     return torch.float16 if device_type == "mps" else torch.bfloat16
 
 
@@ -203,7 +209,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        compute_dtype = get_compute_dtype(self.transformer.wte.weight.device.type)
+        compute_dtype = get_compute_dtype(self.transformer.wte.weight.device)
         self.transformer.wte.to(dtype=compute_dtype)
         for ve in self.value_embeds.values():
             ve.to(dtype=compute_dtype)
@@ -216,7 +222,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        compute_dtype = get_compute_dtype(torch.device(device).type)
+        compute_dtype = get_compute_dtype(device)
         cos, sin = cos.to(dtype=compute_dtype), sin.to(dtype=compute_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
@@ -364,7 +370,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
-    X = g.to(dtype=get_compute_dtype(g.device.type))
+    X = g.to(dtype=get_compute_dtype(g.device))
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -528,6 +534,7 @@ elif device_type == "mps":
 elif device_type == "cpu":
     autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
 else:
+    import contextlib
     autocast_ctx = contextlib.nullcontext()
 
 H100_BF16_PEAK_FLOPS = 989.5e12
